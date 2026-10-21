@@ -1,4 +1,4 @@
-"""ReconciliationApp MVP 3.0 — local CSV invoice/payment reconciliation."""
+"""ReconciliationApp MVP 4.0 — faster reconciliation for larger CSV files."""
 import io
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 
@@ -48,6 +48,10 @@ def read_csv(upload, required, label):
 
 
 def reconcile(invoices, payments):
+    """Reconcile using integer cents and vectorized pandas grouping.
+
+    Exact duplicate payment IDs count once; conflicting IDs are all excluded.
+    """
     invoices, payments = invoices.copy(), payments.copy()
     for label, df, key in [('Invoices', invoices, 'invoice_id'), ('Payments', payments, 'payment_id')]:
         if df[key].eq('').any():
@@ -58,53 +62,46 @@ def reconcile(invoices, payments):
         duplicate = invoices.loc[invoices['invoice_id'].duplicated(), 'invoice_id'].iloc[0]
         raise ValueError(f'Invoices: invoice_id {duplicate!r} appears more than once. Fix the source file.')
 
-    totals = {r['invoice_id']: parse_amount(r['amount'], 'Invoice') for _, r in invoices.iterrows()}
-    paid = {iid: Decimal('0.00') for iid in totals}
-    groups = {}
-    for _, row in payments.iterrows():
-        groups.setdefault(row['payment_id'], []).append(row)
+    # Validate exact monetary values; use integer cents to avoid floating-point drift.
+    invoices['_cents'] = invoices['amount'].map(lambda x: int(parse_amount(x, 'Invoice') * 100))
+    payments['_cents'] = payments['amount'].map(lambda x: int(parse_amount(x, 'Payment') * 100))
+    if invoices['_cents'].sum() > 9_000_000_000_000_000 or payments['_cents'].sum() > 9_000_000_000_000_000:
+        raise ValueError('Total amount is too large for this prototype.')
 
-    issues, rejected = [], set()
-    for pid, rows in groups.items():
-        signatures = {(r['invoice_id'], parse_amount(r['amount'], 'Payment')) for r in rows}
-        if len(signatures) > 1:
-            rejected.add(pid)
-            issues.extend({**r.to_dict(), 'reason': 'PAYMENT_ID_CONFLICT'} for r in rows)
-        elif len(rows) > 1:
-            issues.extend({**r.to_dict(), 'reason': 'DUPLICATE'} for r in rows[1:])
+    # A payment ID is conflicting when its invoice ID or amount differs.
+    signature_counts = payments.groupby('payment_id', sort=False)[['invoice_id', '_cents']].nunique(dropna=False)
+    conflicting_ids = signature_counts.index[(signature_counts['invoice_id'] > 1) | (signature_counts['_cents'] > 1)]
+    conflicts_mask = payments['payment_id'].isin(conflicting_ids)
+    duplicates_mask = payments.duplicated('payment_id', keep='first') & ~conflicts_mask
+    issues = payments.loc[conflicts_mask | duplicates_mask].drop(columns='_cents').copy()
+    issues['reason'] = ['PAYMENT_ID_CONFLICT' if x else 'DUPLICATE' for x in conflicts_mask[conflicts_mask | duplicates_mask]]
 
-    unmatched, seen, accepted = [], set(), Decimal('0.00')
-    for _, row in payments.iterrows():
-        pid, iid = row['payment_id'], row['invoice_id']
-        if pid in rejected or pid in seen:
-            continue
-        seen.add(pid)
-        if not iid or iid.lower() in {'none', 'nan', 'null'}:
-            unmatched.append({**row.to_dict(), 'reason': 'MISSING_INVOICE_ID'})
-        elif iid not in totals:
-            unmatched.append({**row.to_dict(), 'reason': 'INVOICE_NOT_FOUND'})
-        else:
-            amount = parse_amount(row['amount'], 'Payment')
-            paid[iid] += amount
-            accepted += amount
+    accepted_rows = payments.loc[~conflicts_mask & ~duplicates_mask].copy()
+    missing_mask = accepted_rows['invoice_id'].str.lower().isin(['', 'none', 'nan', 'null'])
+    unknown_mask = ~missing_mask & ~accepted_rows['invoice_id'].isin(invoices['invoice_id'])
+    unmatched = accepted_rows.loc[missing_mask | unknown_mask].drop(columns='_cents').copy()
+    unmatched['reason'] = ['MISSING_INVOICE_ID' if x else 'INVOICE_NOT_FOUND' for x in missing_mask[missing_mask | unknown_mask]]
 
-    results = []
-    for _, row in invoices.iterrows():
-        iid = row['invoice_id']
-        total, received = totals[iid], paid[iid]
-        status = ('UNPAID' if received == 0 and total > 0 else
-                  'PARTIALLY_PAID' if received < total else
-                  'PAID' if received == total else 'OVERPAID')
-        results.append({
-            'invoice_id': iid, 'customer': row['customer'],
-            'invoice_amount': float(total), 'paid_amount': float(received),
-            'remaining': float(max(total - received, Decimal('0'))),
-            'overpayment': float(max(received - total, Decimal('0'))),
-            'difference': float(abs(total - received)), 'status': status,
-        })
-    columns = list(payments.columns) + ['reason']
-    return (pd.DataFrame(results), pd.DataFrame(unmatched, columns=columns),
-            pd.DataFrame(issues, columns=columns), accepted)
+    valid = accepted_rows.loc[~missing_mask & ~unknown_mask]
+    paid_cents = valid.groupby('invoice_id', sort=False)['_cents'].sum()
+    accepted = Decimal(int(valid['_cents'].sum())) / 100
+
+    results = invoices[['invoice_id', 'customer']].copy()
+    total = invoices['_cents'].to_numpy(dtype='int64')
+    received = results['invoice_id'].map(paid_cents).fillna(0).to_numpy(dtype='int64')
+    results['invoice_amount'] = total / 100
+    results['paid_amount'] = received / 100
+    results['remaining'] = (total - received).clip(min=0) / 100
+    results['overpayment'] = (received - total).clip(min=0) / 100
+    results['difference'] = abs(total - received) / 100
+    # A zero-amount invoice with no payment is PAID, as in MVP 3.0.
+    import numpy as np
+    results['status'] = np.select(
+        [(received == 0) & (total > 0), received < total, received == total],
+        ['UNPAID', 'PARTIALLY_PAID', 'PAID'], default='OVERPAID'
+    )
+    columns = list(payments.drop(columns='_cents').columns) + ['reason']
+    return (results, unmatched.reindex(columns=columns), issues.reindex(columns=columns), accepted)
 
 
 def csv_data(frame):
@@ -119,9 +116,12 @@ def excel_data(sheets):
             ws = writer.sheets[name]
             ws.freeze_panes = 'A2'
             ws.auto_filter.ref = ws.dimensions
-            for cells in ws.columns:
-                letter = cells[0].column_letter
-                ws.column_dimensions[letter].width = min(40, max(14, max(len(str(c.value or '')) for c in cells) + 3))
+            for col_idx, name in enumerate(frame.columns, start=1):
+                from openpyxl.utils import get_column_letter
+                # Sample cells instead of traversing every Excel row a second time.
+                samples = frame[name].head(200).astype(str)
+                width = max(len(str(name)), samples.map(len).max() if not samples.empty else 0)
+                ws.column_dimensions[get_column_letter(col_idx)].width = min(40, max(14, width + 3))
     return output.getvalue()
 
 
@@ -132,7 +132,7 @@ def euro(value):
 def main():
     st.set_page_config(page_title='ReconciliationApp', page_icon='💼', layout='wide')
     st.title('💼 ReconciliationApp')
-    st.caption('Payment reconciliation workspace · MVP 3.0')
+    st.caption('Payment reconciliation workspace · MVP 4.0')
     with st.sidebar:
         st.header('1 · Upload CSV files')
         invoices_file = st.file_uploader('Invoices CSV', type=['csv'], key='invoices')
@@ -215,6 +215,7 @@ def main():
         st.download_button('Download issues CSV', csv_data(issues), 'duplicates_conflicts.csv', 'text/csv')
 
     st.subheader('Export report')
+    st.caption('For very large files, CSV export is faster and uses less memory than Excel.')
     try:
         workbook = excel_data({
             'Reconciliation': results, 'Unmatched': unmatched, 'Duplicates Conflicts': issues,

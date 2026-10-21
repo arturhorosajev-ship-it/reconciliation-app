@@ -1,4 +1,4 @@
-"""ReconciliationApp MVP 4.0 — faster reconciliation for larger CSV files."""
+"""ReconciliationApp MVP 5.0 — faster reconciliation for larger CSV files."""
 import io
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 
@@ -130,103 +130,122 @@ def euro(value):
 
 
 def main():
-    st.set_page_config(page_title='ReconciliationApp', page_icon='💼', layout='wide')
-    st.title('💼 ReconciliationApp')
-    st.caption('Payment reconciliation workspace · MVP 4.0')
+    st.set_page_config(page_title='ReconciliationApp | Workspace', page_icon='💼', layout='wide', initial_sidebar_state='expanded')
+    st.markdown("""<style>
+    .stApp {background: #f6f8fc; color: #14213d;}
+    [data-testid="stSidebar"] {background: #101d38;}
+    [data-testid="stSidebar"] * {color: #f2f5ff;}
+    [data-testid="stSidebar"] [data-testid="stFileUploader"] {border-radius: 12px;}
+    .block-container {padding-top: 1.8rem; max-width: 1500px;}
+    .hero {background:linear-gradient(115deg,#122344,#224e88);padding:24px 28px;border-radius:18px;color:white;margin-bottom:18px;}
+    .hero h1 {color:white;font-size:2rem;margin:0 0 6px;}
+    .hero p {color:#dbe6fa;margin:0;}
+    .section-title {font-size:1.35rem;font-weight:750;margin:18px 0 10px;}
+    div[data-testid="stMetric"] {background:white;border:1px solid #e3e9f2;border-radius:14px;padding:18px 16px;box-shadow:0 2px 8px #0f24400a;}
+    div[data-testid="stMetricLabel"] {color:#52627a;}
+    div[data-testid="stMetricValue"] {color:#172a4d;}
+    div[data-testid="stDataFrame"] {border-radius:12px;overflow:hidden;}
+    </style>""", unsafe_allow_html=True)
     with st.sidebar:
-        st.header('1 · Upload CSV files')
+        st.markdown('## 💼 ReconciliationApp')
+        st.caption('FINANCE OPERATIONS · MVP 5.0')
+        st.divider()
+        page = st.radio('Workspace', ['Dashboard', 'Invoices', 'Exceptions', 'Reports'], label_visibility='collapsed')
+        st.divider()
+        st.markdown('#### Import data')
         invoices_file = st.file_uploader('Invoices CSV', type=['csv'], key='invoices')
         payments_file = st.file_uploader('Payments CSV', type=['csv'], key='payments')
         st.caption('Invoices: invoice_id, customer, amount')
         st.caption('Payments: payment_id, invoice_id, amount')
         st.divider()
-        st.info('Prototype: use synthetic or non-sensitive test data. Do not upload confidential customer records to a public deployment.')
-
+        st.warning('Demo only. Use synthetic or non-sensitive data. Do not upload confidential customer records.')
+    st.markdown('<div class="hero"><h1>Finance workspace</h1><p>Invoice & payment reconciliation · clearer visibility, faster decisions</p></div>', unsafe_allow_html=True)
     if invoices_file is None or payments_file is None:
-        st.info('Upload both CSV files in the left sidebar to see the reconciliation dashboard.')
-        st.stop()
+        st.info('Upload both CSV files in the left sidebar to open your reconciliation workspace.')
+        st.markdown('### Getting started')
+        st.markdown('1. Upload invoices CSV.\n2. Upload payments CSV.\n3. Explore the dashboard, exceptions and reports.')
+        return
     try:
         invoices = read_csv(invoices_file, ['invoice_id', 'customer', 'amount'], 'Invoices')
         payments = read_csv(payments_file, ['payment_id', 'invoice_id', 'amount'], 'Payments')
         results, unmatched, issues, accepted = reconcile(invoices, payments)
     except ValueError as exc:
         st.error(str(exc))
-        st.stop()
-
+        return
     total_invoiced = sum((parse_amount(v, 'Invoice') for v in invoices['amount']), Decimal('0'))
-    all_payment_rows = sum((parse_amount(v, 'Payment') for v in payments['amount']), Decimal('0'))
     outstanding = Decimal(str(results['remaining'].sum())).quantize(CENT)
     overpaid = Decimal(str(results['overpayment'].sum())).quantize(CENT)
-    st.success('Reconciliation completed successfully.')
-    st.subheader('Overview')
-    a, b, c, d = st.columns(4)
-    a.metric('Total invoiced', euro(total_invoiced))
-    b.metric('Accepted payments', euro(accepted))
-    c.metric('Outstanding', euro(outstanding))
-    d.metric('Overpayments', euro(overpaid))
-    st.caption(f'{len(invoices)} invoices · {len(payments)} payment rows · '
-               f'{len(unmatched)} unmatched · {len(issues)} duplicate/conflict rows · '
-               f'{euro(all_payment_rows)} in raw payment rows')
-
-    st.subheader('Invoice status breakdown')
     status_counts = results['status'].value_counts().reindex(STATUS_ORDER, fill_value=0)
-    st.bar_chart(status_counts.rename_axis('Status').rename('Invoices'))
-
-    with st.expander('View uploaded data'):
-        st.markdown('**Invoices**')
-        st.dataframe(invoices, hide_index=True, use_container_width=True)
-        st.markdown('**Payments**')
-        st.dataframe(payments, hide_index=True, use_container_width=True)
-
-    st.subheader('Reconciliation results')
-    col1, col2 = st.columns([1, 2])
-    with col1:
-        statuses = st.multiselect('Filter by status', STATUS_ORDER)
-    with col2:
-        query = st.text_input('Search invoice or customer')
-    filtered = results.copy()
-    if statuses:
-        filtered = filtered[filtered['status'].isin(statuses)]
-    if query.strip():
-        term = query.strip()
-        filtered = filtered[
-            filtered['invoice_id'].str.contains(term, case=False, regex=False) |
-            filtered['customer'].str.contains(term, case=False, regex=False)
-        ]
-    st.caption(f'Showing {len(filtered)} of {len(results)} invoices')
-    st.dataframe(filtered, hide_index=True, use_container_width=True)
-    st.download_button('Download reconciliation CSV', csv_data(results),
-                       'reconciliation_results.csv', 'text/csv')
-
-    left, right = st.columns(2)
-    with left:
-        st.subheader('Unmatched payments')
-        if unmatched.empty:
-            st.success('No unmatched payments.')
-        else:
-            st.dataframe(unmatched, hide_index=True, use_container_width=True)
-        st.download_button('Download unmatched CSV', csv_data(unmatched), 'unmatched_payments.csv', 'text/csv')
-    with right:
-        st.subheader('Duplicates / conflicts')
-        if issues.empty:
-            st.success('No duplicate or conflicting payments.')
-        else:
-            st.dataframe(issues, hide_index=True, use_container_width=True)
-        st.download_button('Download issues CSV', csv_data(issues), 'duplicates_conflicts.csv', 'text/csv')
-
-    st.subheader('Export report')
-    st.caption('For very large files, CSV export is faster and uses less memory than Excel.')
-    try:
-        workbook = excel_data({
-            'Reconciliation': results, 'Unmatched': unmatched, 'Duplicates Conflicts': issues,
-            'Invoices': invoices, 'Payments': payments,
-        })
-        st.download_button('📥 Download complete Excel report', workbook,
-                           'reconciliation_report.xlsx',
-                           'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', type='primary')
-    except ImportError:
-        st.warning('Excel export needs openpyxl: python -m pip install openpyxl')
-    st.caption('Reconciliation rules: identical duplicate payment IDs count once; conflicting IDs are excluded pending review. Amounts are assumed to be in one currency (EUR).')
+    if page == 'Dashboard':
+        st.success('Reconciliation completed successfully.')
+        st.markdown('<div class="section-title">Financial overview</div>', unsafe_allow_html=True)
+        a,b,c,d = st.columns(4)
+        a.metric('Total invoiced', euro(total_invoiced))
+        b.metric('Accepted payments', euro(accepted))
+        c.metric('Outstanding', euro(outstanding))
+        d.metric('Overpayments', euro(overpaid))
+        st.caption(f'{len(invoices):,} invoices · {len(payments):,} payment rows · {len(unmatched):,} unmatched · {len(issues):,} duplicate/conflict rows')
+        st.markdown('<div class="section-title">Invoice health</div>', unsafe_allow_html=True)
+        a,b,c,d = st.columns(4)
+        for col, status, label in zip([a,b,c,d], STATUS_ORDER, ['Paid', 'Partially paid', 'Unpaid', 'Overpaid']):
+            col.metric(label, f'{int(status_counts[status]):,}')
+        left,right = st.columns([1.3,1])
+        with left:
+            st.markdown('#### Status distribution')
+            st.bar_chart(status_counts.rename_axis('Status').rename('Invoices'))
+        with right:
+            st.markdown('#### Attention required')
+            st.metric('Unmatched payment rows', f'{len(unmatched):,}')
+            st.metric('Duplicate / conflict rows', f'{len(issues):,}')
+            st.caption('Review exceptions before using figures for business decisions.')
+        st.markdown('#### Recent invoices')
+        st.dataframe(results.head(20), hide_index=True, use_container_width=True)
+    elif page == 'Invoices':
+        st.markdown('## Invoices')
+        col1,col2=st.columns([1,2])
+        with col1: statuses=st.multiselect('Filter by status', STATUS_ORDER)
+        with col2: query=st.text_input('Search invoice or customer')
+        filtered=results
+        if statuses: filtered=filtered[filtered['status'].isin(statuses)]
+        if query.strip():
+            term=query.strip()
+            filtered=filtered[filtered['invoice_id'].str.contains(term,case=False,regex=False) | filtered['customer'].str.contains(term,case=False,regex=False)]
+        st.caption(f'Showing {len(filtered):,} of {len(results):,} invoices')
+        st.dataframe(filtered,hide_index=True,use_container_width=True)
+        st.download_button('Download all reconciliation results (CSV)',csv_data(results),'reconciliation_results.csv','text/csv')
+    elif page == 'Exceptions':
+        st.markdown('## Exceptions & payment review')
+        left,right=st.columns(2)
+        with left:
+            st.markdown('#### Unmatched payments')
+            if unmatched.empty: st.success('No unmatched payments.')
+            else: st.dataframe(unmatched,hide_index=True,use_container_width=True)
+            st.download_button('Download unmatched CSV',csv_data(unmatched),'unmatched_payments.csv','text/csv')
+        with right:
+            st.markdown('#### Duplicate / conflicting payments')
+            if issues.empty: st.success('No duplicate or conflicting payments.')
+            else: st.dataframe(issues,hide_index=True,use_container_width=True)
+            st.download_button('Download issues CSV',csv_data(issues),'duplicates_conflicts.csv','text/csv')
+        st.info('Identical duplicate payment IDs count once; conflicting IDs are excluded pending review.')
+    else:
+        st.markdown('## Reports & exports')
+        st.caption('CSV export is generally faster and lighter for large datasets.')
+        st.download_button('Download reconciliation CSV',csv_data(results),'reconciliation_results.csv','text/csv')
+        st.download_button('Download unmatched CSV',csv_data(unmatched),'unmatched_payments.csv','text/csv')
+        st.download_button('Download issues CSV',csv_data(issues),'duplicates_conflicts.csv','text/csv')
+        if st.button('Prepare Excel workbook'):
+            try:
+                st.session_state['report_excel'] = excel_data({'Reconciliation':results,'Unmatched':unmatched,'Duplicates Conflicts':issues,'Invoices':invoices,'Payments':payments})
+            except ImportError:
+                st.warning('Excel export requires openpyxl.')
+        if 'report_excel' in st.session_state:
+            st.download_button('📥 Download complete Excel report',st.session_state['report_excel'],'reconciliation_report.xlsx','application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',type='primary')
+        with st.expander('View uploaded data'):
+            st.markdown('**Invoices**')
+            st.dataframe(invoices,hide_index=True,use_container_width=True)
+            st.markdown('**Payments**')
+            st.dataframe(payments,hide_index=True,use_container_width=True)
+    st.caption('Prototype · EUR only · financial results require review before operational use.')
 
 
 if __name__ == '__main__':
